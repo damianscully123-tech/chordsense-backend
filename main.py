@@ -23,67 +23,56 @@ CHORD_FINGERINGS = {
     "C7": "x32310",
     "Cmaj7": "x32000",
     "Cm7": "x35343",
-
     "C#": "x46664",
     "C#m": "x46654",
     "C#7": "x46464",
     "C#maj7": "x46564",
     "C#m7": "x46454",
-
     "D": "xx0232",
     "Dm": "xx0231",
     "D7": "xx0212",
     "Dmaj7": "xx0222",
     "Dm7": "xx0211",
-
     "Eb": "x65343",
     "Ebm": "x68876",
     "Eb7": "x65646",
     "Ebmaj7": "x65756",
     "Ebm7": "x68676",
-
     "E": "022100",
     "Em": "022000",
     "E7": "020100",
     "Emaj7": "021100",
     "Em7": "022030",
-
     "F": "133211",
     "Fm": "133111",
     "F7": "131211",
     "Fmaj7": "xx3210",
     "Fm7": "131111",
-
     "F#": "244322",
     "F#m": "244222",
     "F#7": "242322",
     "F#maj7": "243322",
     "F#m7": "242222",
-
     "G": "320003",
     "Gm": "355333",
     "G7": "320001",
     "Gmaj7": "320002",
     "Gm7": "353333",
-
     "Ab": "466544",
     "Abm": "466444",
     "Ab7": "464544",
     "Abmaj7": "465544",
     "Abm7": "464444",
-
     "A": "x02220",
     "Am": "x02210",
     "A7": "x02020",
     "Amaj7": "x02120",
     "Am7": "x02010",
-
     "Bb": "x13331",
     "Bbm": "x13321",
     "Bb7": "x13131",
     "Bbmaj7": "x13231",
     "Bbm7": "x13121",
-
     "B": "x24442",
     "Bm": "x24432",
     "B7": "x21202",
@@ -102,8 +91,8 @@ CHORD_PATTERNS = {
 }
 
 
-def build_chord_templates():
-    templates = {}
+def build_chord_templates() -> Dict[str, np.ndarray]:
+    templates: Dict[str, np.ndarray] = {}
 
     for root_index, root_name in enumerate(NOTE_NAMES):
         for suffix, intervals in CHORD_PATTERNS.items():
@@ -118,17 +107,17 @@ def build_chord_templates():
 ALL_TEMPLATES = build_chord_templates()
 
 
-def normalize(v):
+def normalize(v: np.ndarray) -> np.ndarray:
     s = np.sum(v)
     return v / s if s > 0 else v
 
 
-def estimate_key(chroma_mean):
+def estimate_key(chroma_mean: np.ndarray) -> str:
     idx = int(np.argmax(chroma_mean))
     return f"{NOTE_NAMES[idx]} Major"
 
 
-def estimate_chord(chroma_vec):
+def estimate_chord(chroma_vec: np.ndarray) -> str:
     chroma_vec = normalize(chroma_vec)
 
     best_name = "C"
@@ -137,7 +126,6 @@ def estimate_chord(chroma_vec):
     for name, template in ALL_TEMPLATES.items():
         score = float(np.dot(chroma_vec, normalize(template)))
 
-        # ✅ SMALL bonus for common musical chords ONLY
         if any(tag in name for tag in ["7", "maj7", "m7"]):
             score += 0.005
 
@@ -148,7 +136,7 @@ def estimate_chord(chroma_vec):
     return best_name
 
 
-def segment_times(duration_sec, count):
+def segment_times(duration_sec: float, count: int) -> List[str]:
     if count <= 0:
         return []
 
@@ -164,18 +152,18 @@ def segment_times(duration_sec, count):
     return out
 
 
-def safe_tempo_value(raw):
+def safe_tempo_value(raw: Any) -> int:
     if isinstance(raw, np.ndarray):
         raw = float(raw.flat[0]) if raw.size > 0 else 92
 
     try:
         tempo = int(round(float(raw)))
         return tempo if tempo > 0 else 92
-    except:
+    except Exception:
         return 92
 
 
-def merge_consecutive_chords(chords):
+def merge_consecutive_chords(chords: List[Dict[str, str]]) -> List[Dict[str, str]]:
     if not chords:
         return []
 
@@ -187,6 +175,10 @@ def merge_consecutive_chords(chords):
 
     return merged
 
+
+@app.get("/")
+def root():
+    return {"message": "ChordSense backend is running"}
 
 @app.get("/health")
 def health():
@@ -206,26 +198,49 @@ async def analyze(
         tmp.write(await audio.read())
 
     try:
-        y, sr = librosa.load(temp_path, sr=22050, mono=True)
+        print(f"Analyzing file: {audio.filename}")
+
+        # Faster load for hosted beta
+        y, sr = librosa.load(temp_path, sr=16000, mono=True)
+        print(f"Loaded audio. Samples: {len(y)}, Sample rate: {sr}")
 
         if y is None or y.size == 0:
             raise HTTPException(status_code=400, detail="Empty audio")
 
-        duration = librosa.get_duration(y=y, sr=sr)
+        # Beta speed limit: analyze first 30 seconds only
+        max_duration_seconds = 30
+        max_samples = sr * max_duration_seconds
+        if len(y) > max_samples:
+            y = y[:max_samples]
+            print("Trimmed audio to first 30 seconds for faster analysis")
 
+        duration = librosa.get_duration(y=y, sr=sr)
+        print(f"Analysis duration: {duration:.2f}s")
+
+        print("Extracting tempo...")
         raw_tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
         tempo = safe_tempo_value(raw_tempo)
 
-        # 🔥 BETTER AUDIO ANALYSIS
+        print("Separating harmonic content...")
         y_harmonic, _ = librosa.effects.hpss(y)
+
+        print("Extracting chroma...")
         chroma = librosa.feature.chroma_cqt(y=y_harmonic, sr=sr)
 
-        if len(beat_frames) < 2:
-            beat_frames = np.arange(0, chroma.shape[1], max(1, chroma.shape[1] // 16))
+        if chroma is None or chroma.size == 0:
+            raise HTTPException(status_code=400, detail="Could not extract chroma features.")
 
+        if beat_frames is None or len(beat_frames) < 2:
+            beat_frames = np.arange(0, chroma.shape[1], max(1, chroma.shape[1] // 8))
+
+        print("Syncing chroma to beats...")
         beat_chroma = librosa.util.sync(chroma, beat_frames, aggregate=np.median)
 
-        max_sections = 16
+        if beat_chroma is None or beat_chroma.size == 0 or beat_chroma.shape[1] == 0:
+            raise HTTPException(status_code=400, detail="Could not build beat-synced chroma.")
+
+        # Fewer sections for speed
+        max_sections = 8
         section_count = min(max_sections, beat_chroma.shape[1])
 
         bounds = np.linspace(0, beat_chroma.shape[1], num=section_count + 1, dtype=int)
@@ -233,6 +248,7 @@ async def analyze(
         chords = []
         times = segment_times(duration, section_count)
 
+        print("Estimating chords...")
         for i in range(section_count):
             start, end = bounds[i], bounds[i + 1]
             section = beat_chroma[:, start:end]
@@ -254,7 +270,7 @@ async def analyze(
         chords = merge_consecutive_chords(chords)
         key = estimate_key(np.mean(chroma, axis=1))
 
-        return {
+        result = {
             "title": audio.filename or "Song",
             "keySignature": key,
             "tempo": tempo,
@@ -263,6 +279,11 @@ async def analyze(
             "chords": chords,
         }
 
+        print("Analysis complete")
+        return result
+
+    except HTTPException:
+        raise
     except Exception as e:
         print("ERROR:", e)
         raise HTTPException(status_code=500, detail=str(e))
