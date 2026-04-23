@@ -93,14 +93,12 @@ CHORD_PATTERNS = {
 
 def build_chord_templates() -> Dict[str, np.ndarray]:
     templates: Dict[str, np.ndarray] = {}
-
     for root_index, root_name in enumerate(NOTE_NAMES):
         for suffix, intervals in CHORD_PATTERNS.items():
             vec = np.zeros(12, dtype=float)
             for interval in intervals:
                 vec[(root_index + interval) % 12] = 1.0
             templates[f"{root_name}{suffix}"] = vec
-
     return templates
 
 
@@ -125,10 +123,8 @@ def estimate_chord(chroma_vec: np.ndarray) -> str:
 
     for name, template in ALL_TEMPLATES.items():
         score = float(np.dot(chroma_vec, normalize(template)))
-
         if any(tag in name for tag in ["7", "maj7", "m7"]):
             score += 0.005
-
         if score > best_score:
             best_score = score
             best_name = name
@@ -168,17 +164,16 @@ def merge_consecutive_chords(chords: List[Dict[str, str]]) -> List[Dict[str, str
         return []
 
     merged = [chords[0]]
-
     for c in chords[1:]:
         if c["chord"] != merged[-1]["chord"]:
             merged.append(c)
-
     return merged
 
 
 @app.get("/")
 def root():
     return {"message": "ChordSense backend is running"}
+
 
 @app.get("/health")
 def health():
@@ -200,19 +195,19 @@ async def analyze(
     try:
         print(f"Analyzing file: {audio.filename}")
 
-        # Faster load for hosted beta
-        y, sr = librosa.load(temp_path, sr=16000, mono=True)
+        # Lower sample rate = lower memory
+        y, sr = librosa.load(temp_path, sr=11025, mono=True)
         print(f"Loaded audio. Samples: {len(y)}, Sample rate: {sr}")
 
         if y is None or y.size == 0:
             raise HTTPException(status_code=400, detail="Empty audio")
 
-        # Beta speed limit: analyze first 30 seconds only
-        max_duration_seconds = 30
+        # Hosted beta limit: first 20 seconds only
+        max_duration_seconds = 20
         max_samples = sr * max_duration_seconds
         if len(y) > max_samples:
             y = y[:max_samples]
-            print("Trimmed audio to first 30 seconds for faster analysis")
+            print("Trimmed audio to first 20 seconds")
 
         duration = librosa.get_duration(y=y, sr=sr)
         print(f"Analysis duration: {duration:.2f}s")
@@ -221,17 +216,14 @@ async def analyze(
         raw_tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
         tempo = safe_tempo_value(raw_tempo)
 
-        print("Separating harmonic content...")
-        y_harmonic, _ = librosa.effects.hpss(y)
-
         print("Extracting chroma...")
-        chroma = librosa.feature.chroma_cqt(y=y_harmonic, sr=sr)
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_fft=2048, hop_length=1024)
 
         if chroma is None or chroma.size == 0:
             raise HTTPException(status_code=400, detail="Could not extract chroma features.")
 
         if beat_frames is None or len(beat_frames) < 2:
-            beat_frames = np.arange(0, chroma.shape[1], max(1, chroma.shape[1] // 8))
+            beat_frames = np.arange(0, chroma.shape[1], max(1, chroma.shape[1] // 6))
 
         print("Syncing chroma to beats...")
         beat_chroma = librosa.util.sync(chroma, beat_frames, aggregate=np.median)
@@ -239,8 +231,7 @@ async def analyze(
         if beat_chroma is None or beat_chroma.size == 0 or beat_chroma.shape[1] == 0:
             raise HTTPException(status_code=400, detail="Could not build beat-synced chroma.")
 
-        # Fewer sections for speed
-        max_sections = 8
+        max_sections = 6
         section_count = min(max_sections, beat_chroma.shape[1])
 
         bounds = np.linspace(0, beat_chroma.shape[1], num=section_count + 1, dtype=int)
