@@ -202,13 +202,6 @@ async def analyze(
         if y is None or y.size == 0:
             raise HTTPException(status_code=400, detail="Empty audio")
 
-        # Hosted beta limit: first 20 seconds only
-        max_duration_seconds = 20
-        max_samples = sr * max_duration_seconds
-        if len(y) > max_samples:
-            y = y[:max_samples]
-            print("Trimmed audio to first 20 seconds")
-
         duration = librosa.get_duration(y=y, sr=sr)
         print(f"Analysis duration: {duration:.2f}s")
 
@@ -231,7 +224,7 @@ async def analyze(
         if beat_chroma is None or beat_chroma.size == 0 or beat_chroma.shape[1] == 0:
             raise HTTPException(status_code=400, detail="Could not build beat-synced chroma.")
 
-        max_sections = 6
+        max_sections = 16
         section_count = min(max_sections, beat_chroma.shape[1])
 
         bounds = np.linspace(0, beat_chroma.shape[1], num=section_count + 1, dtype=int)
