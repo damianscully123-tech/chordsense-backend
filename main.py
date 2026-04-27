@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import librosa
 import numpy as np
@@ -17,70 +17,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CHORD_FINGERINGS = {
-    "C": "x32010",
-    "Cm": "x35543",
-    "C7": "x32310",
-    "Cmaj7": "x32000",
-    "Cm7": "x35343",
-    "C#": "x46664",
-    "C#m": "x46654",
-    "C#7": "x46464",
-    "C#maj7": "x46564",
-    "C#m7": "x46454",
-    "D": "xx0232",
-    "Dm": "xx0231",
-    "D7": "xx0212",
-    "Dmaj7": "xx0222",
-    "Dm7": "xx0211",
-    "Eb": "x65343",
-    "Ebm": "x68876",
-    "Eb7": "x65646",
-    "Ebmaj7": "x65756",
-    "Ebm7": "x68676",
-    "E": "022100",
-    "Em": "022000",
-    "E7": "020100",
-    "Emaj7": "021100",
-    "Em7": "022030",
-    "F": "133211",
-    "Fm": "133111",
-    "F7": "131211",
-    "Fmaj7": "xx3210",
-    "Fm7": "131111",
-    "F#": "244322",
-    "F#m": "244222",
-    "F#7": "242322",
-    "F#maj7": "243322",
-    "F#m7": "242222",
-    "G": "320003",
-    "Gm": "355333",
-    "G7": "320001",
-    "Gmaj7": "320002",
-    "Gm7": "353333",
-    "Ab": "466544",
-    "Abm": "466444",
-    "Ab7": "464544",
-    "Abmaj7": "465544",
-    "Abm7": "464444",
-    "A": "x02220",
-    "Am": "x02210",
-    "A7": "x02020",
-    "Amaj7": "x02120",
-    "Am7": "x02010",
-    "Bb": "x13331",
-    "Bbm": "x13321",
-    "Bb7": "x13131",
-    "Bbmaj7": "x13231",
-    "Bbm7": "x13121",
-    "B": "x24442",
-    "Bm": "x24432",
-    "B7": "x21202",
-    "Bmaj7": "x24342",
-    "Bm7": "x20202",
-}
-
 NOTE_NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+
+CHORD_FINGERINGS = {
+    "C": "x32010", "Cm": "x35543", "D": "xx0232", "Dm": "xx0231",
+    "E": "022100", "Em": "022000", "F": "133211", "Fm": "133111",
+    "F#": "244322", "F#m": "244222", "G": "320003", "Gm": "355333",
+    "A": "x02220", "Am": "x02210", "Bb": "x13331", "Bbm": "x13321",
+    "B": "x24442", "Bm": "x24432",
+
+    "C7": "x32310", "D7": "xx0212", "E7": "020100", "F7": "131211",
+    "G7": "320001", "A7": "x02020", "B7": "x21202",
+
+    "Cmaj7": "x32000", "Dmaj7": "xx0222", "Emaj7": "021100",
+    "Fmaj7": "xx3210", "Gmaj7": "320002", "Amaj7": "x02120",
+    "Bbmaj7": "x13231", "Bmaj7": "x24342",
+
+    "Cm7": "x35343", "Dm7": "xx0211", "Em7": "022030",
+    "Fm7": "131111", "Gm7": "353333", "Am7": "x02010",
+    "Bbm7": "x13121", "Bm7": "x20202",
+}
 
 CHORD_PATTERNS = {
     "": [0, 4, 7],
@@ -90,95 +46,124 @@ CHORD_PATTERNS = {
     "m7": [0, 3, 7, 10],
 }
 
+COMMON_SUFFIX_WEIGHT = {
+    "": 0.045,
+    "m": 0.045,
+    "7": 0.010,
+    "maj7": -0.010,
+    "m7": -0.006,
+}
 
-def build_chord_templates() -> Dict[str, np.ndarray]:
-    templates: Dict[str, np.ndarray] = {}
-    for root_index, root_name in enumerate(NOTE_NAMES):
+def build_templates() -> Dict[str, np.ndarray]:
+    templates = {}
+    for root_index, root in enumerate(NOTE_NAMES):
         for suffix, intervals in CHORD_PATTERNS.items():
-            vec = np.zeros(12, dtype=float)
+            vec = np.zeros(12)
             for interval in intervals:
                 vec[(root_index + interval) % 12] = 1.0
-            templates[f"{root_name}{suffix}"] = vec
+            templates[root + suffix] = vec
     return templates
 
-
-ALL_TEMPLATES = build_chord_templates()
-
+ALL_TEMPLATES = build_templates()
 
 def normalize(v: np.ndarray) -> np.ndarray:
-    s = np.sum(v)
-    return v / s if s > 0 else v
+    total = float(np.sum(v))
+    return v / total if total > 0 else v
 
+def split_chord(chord: str) -> Tuple[str, str]:
+    if len(chord) >= 2 and chord[1] in ["#", "b"]:
+        return chord[:2], chord[2:]
+    return chord[:1], chord[1:]
+
+def simplify_chord(chord: str) -> str:
+    root, suffix = split_chord(chord)
+
+    if suffix in ["maj7", "7"]:
+        return root
+    if suffix == "m7":
+        return root + "m"
+
+    return chord
+
+def estimate_chord(chroma_vec: np.ndarray) -> str:
+    chroma_vec = normalize(chroma_vec)
+
+    scores = []
+
+    for name, template in ALL_TEMPLATES.items():
+        root, suffix = split_chord(name)
+        template_norm = normalize(template)
+
+        score = float(np.dot(chroma_vec, template_norm))
+        score += COMMON_SUFFIX_WEIGHT.get(suffix, -0.02)
+
+        scores.append((name, score))
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+
+    best_name, best_score = scores[0]
+    simplified = simplify_chord(best_name)
+
+    # If a simple version is close enough, prefer it.
+    for name, score in scores[:8]:
+        if name == simplified and best_score - score < 0.08:
+            return name
+
+    return simplified
 
 def estimate_key(chroma_mean: np.ndarray) -> str:
     idx = int(np.argmax(chroma_mean))
     return f"{NOTE_NAMES[idx]} Major"
 
-
-def estimate_chord(chroma_vec: np.ndarray) -> str:
-    chroma_vec = normalize(chroma_vec)
-
-    best_name = "C"
-    best_score = -1.0
-
-    for name, template in ALL_TEMPLATES.items():
-        score = float(np.dot(chroma_vec, normalize(template)))
-        if any(tag in name for tag in ["7", "maj7", "m7"]):
-            score += 0.005
-        if score > best_score:
-            best_score = score
-            best_name = name
-
-    return best_name
-
-
-def segment_times(duration_sec: float, count: int) -> List[str]:
-    if count <= 0:
-        return []
-
-    step = duration_sec / count
-    out = []
-
-    for i in range(count):
-        total = int(i * step)
-        minutes = total // 60
-        seconds = total % 60
-        out.append(f"{minutes}:{seconds:02d}")
-
-    return out
-
+def format_time(seconds: float) -> str:
+    total = int(seconds)
+    return f"{total // 60}:{total % 60:02d}"
 
 def safe_tempo_value(raw: Any) -> int:
     if isinstance(raw, np.ndarray):
         raw = float(raw.flat[0]) if raw.size > 0 else 92
-
     try:
         tempo = int(round(float(raw)))
         return tempo if tempo > 0 else 92
     except Exception:
         return 92
 
-
 def merge_consecutive_chords(chords: List[Dict[str, str]]) -> List[Dict[str, str]]:
     if not chords:
         return []
 
     merged = [chords[0]]
-    for c in chords[1:]:
-        if c["chord"] != merged[-1]["chord"]:
-            merged.append(c)
+    for chord in chords[1:]:
+        if chord["chord"] != merged[-1]["chord"]:
+            merged.append(chord)
+
     return merged
 
+def remove_fast_noise(chords: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    if len(chords) < 3:
+        return chords
+
+    cleaned = []
+    for i, chord in enumerate(chords):
+        if 0 < i < len(chords) - 1:
+            prev_chord = chords[i - 1]["chord"]
+            next_chord = chords[i + 1]["chord"]
+            current = chord["chord"]
+
+            if prev_chord == next_chord and current != prev_chord:
+                continue
+
+        cleaned.append(chord)
+
+    return cleaned
 
 @app.get("/")
 def root():
     return {"message": "ChordSense backend is running"}
 
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 @app.post("/analyze")
 async def analyze(
@@ -195,68 +180,68 @@ async def analyze(
     try:
         print(f"Analyzing file: {audio.filename}")
 
-        # Lower sample rate = lower memory
-        y, sr = librosa.load(temp_path, sr=11025, mono=True)
-        print(f"Loaded audio. Samples: {len(y)}, Sample rate: {sr}")
+        y, sr = librosa.load(temp_path, sr=16000, mono=True)
 
         if y is None or y.size == 0:
             raise HTTPException(status_code=400, detail="Empty audio")
 
-        duration = librosa.get_duration(y=y, sr=sr)
-        print(f"Analysis duration: {duration:.2f}s")
+        duration = float(librosa.get_duration(y=y, sr=sr))
+        print(f"Duration: {duration:.2f}s")
 
-        print("Extracting tempo...")
-        raw_tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+        raw_tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
         tempo = safe_tempo_value(raw_tempo)
 
-        print("Extracting chroma...")
-        chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_fft=2048, hop_length=1024)
+        # Harmonic separation helps reduce drums/percussion.
+        y_harmonic, _ = librosa.effects.hpss(y)
+
+        # STFT chroma is lighter than CQT and works better on Render memory.
+        chroma = librosa.feature.chroma_stft(
+            y=y_harmonic,
+            sr=sr,
+            n_fft=4096,
+            hop_length=2048,
+        )
 
         if chroma is None or chroma.size == 0:
-            raise HTTPException(status_code=400, detail="Could not extract chroma features.")
+            raise HTTPException(status_code=400, detail="Could not extract chroma.")
 
-        if beat_frames is None or len(beat_frames) < 2:
-            beat_frames = np.arange(0, chroma.shape[1], max(1, chroma.shape[1] // 6))
+        frame_count = chroma.shape[1]
+        seconds_per_frame = 2048 / sr
 
-        print("Syncing chroma to beats...")
-        beat_chroma = librosa.util.sync(chroma, beat_frames, aggregate=np.median)
-
-        if beat_chroma is None or beat_chroma.size == 0 or beat_chroma.shape[1] == 0:
-            raise HTTPException(status_code=400, detail="Could not build beat-synced chroma.")
-
-        max_sections = 16
-        section_count = min(max_sections, beat_chroma.shape[1])
-
-        bounds = np.linspace(0, beat_chroma.shape[1], num=section_count + 1, dtype=int)
+        # Analyze roughly every 6 seconds.
+        window_seconds = 6
+        window_frames = max(1, int(window_seconds / seconds_per_frame))
 
         chords = []
-        times = segment_times(duration, section_count)
+        for start in range(0, frame_count, window_frames):
+            end = min(start + window_frames, frame_count)
+            section = chroma[:, start:end]
 
-        print("Estimating chords...")
-        for i in range(section_count):
-            start, end = bounds[i], bounds[i + 1]
-            section = beat_chroma[:, start:end]
+            if section.shape[1] == 0:
+                continue
 
-            vec = (
-                np.mean(section, axis=1)
-                if section.shape[1] > 0
-                else beat_chroma[:, min(start, beat_chroma.shape[1] - 1)]
-            )
-
-            chord_name = estimate_chord(vec)
+            section_vec = np.median(section, axis=1)
+            chord_name = estimate_chord(section_vec)
+            time_sec = start * seconds_per_frame
 
             chords.append({
                 "chord": chord_name,
                 "fingering": CHORD_FINGERINGS.get(chord_name, "x32010"),
-                "time": times[i],
+                "time": format_time(time_sec),
             })
 
         chords = merge_consecutive_chords(chords)
-        key = estimate_key(np.mean(chroma, axis=1))
+        chords = remove_fast_noise(chords)
+        chords = merge_consecutive_chords(chords)
+
+        # Limit display to avoid clutter, but keep real progression.
+        chords = chords[:32]
+
+        key_signature = estimate_key(np.mean(chroma, axis=1))
 
         result = {
             "title": audio.filename or "Song",
-            "keySignature": key,
+            "keySignature": key_signature,
             "tempo": tempo,
             "difficulty": difficulty,
             "sourceType": sourceType,
